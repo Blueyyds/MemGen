@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
-    AutoModelForCausalLM, 
+    AutoModelForCausalLM,
     AutoTokenizer,
     PreTrainedTokenizerBase,
-    GenerationConfig
+    GenerationConfig,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import PeftConfig, LoraConfig
@@ -20,35 +20,36 @@ from larm.common.registry import registry
 from .weaver import MemGenWeaver
 from .trigger import MemGenTrigger, NanoTrigger
 from .utils import (
-    CONVERSATION_TEMPLATE, 
-    load_state_dict_from_safetensor, 
+    CONVERSATION_TEMPLATE,
+    load_state_dict_from_safetensor,
     fix_model_parameters,
     log_trainable_params,
 )
+
 
 def get_next_token(next_token_logits: torch.Tensor, do_sample: bool, temperature: float) -> torch.Tensor:
     """
     Selects the next token from model logits.
 
     Two modes are supported:
-    1. Sampling mode (do_sample=True and temperature>0):  
-       Apply temperature scaling to the logits, compute a probability distribution with softmax, 
+    1. Sampling mode (do_sample=True and temperature>0):
+       Apply temperature scaling to the logits, compute a probability distribution with softmax,
        and randomly sample one token.
-    2. Greedy mode (do_sample=False or temperature==0):  
+    2. Greedy mode (do_sample=False or temperature==0):
        Select the token with the highest probability (argmax).
 
     Args:
-        next_token_logits (torch.Tensor): 
+        next_token_logits (torch.Tensor):
             Logits for the next tokens, shape [batch_size, vocab_size].
-        do_sample (bool): 
+        do_sample (bool):
             Whether to perform stochastic sampling. If False, greedy decoding is used.
-        temperature (float): 
-            Sampling temperature. Higher values make the distribution flatter (more randomness), 
-            while lower values make it sharper (more deterministic). 
+        temperature (float):
+            Sampling temperature. Higher values make the distribution flatter (more randomness),
+            while lower values make it sharper (more deterministic).
             When set to 0, greedy decoding is enforced.
 
     Returns:
-        torch.Tensor: 
+        torch.Tensor:
             The selected next token indices, shape [batch_size, 1].
     """
     if len(next_token_logits.shape) != 2:
@@ -66,16 +67,16 @@ def generate_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
     """
     Generate position ID tensor based on the given attention mask.
 
-    The position IDs are computed as the cumulative count of non-padding tokens 
+    The position IDs are computed as the cumulative count of non-padding tokens
     within each sequence. Padding tokens are always assigned position ID 0.
 
     Args:
-        attention_mask (torch.Tensor): 
-            A tensor of shape (batch_size, sequence_length). 
+        attention_mask (torch.Tensor):
+            A tensor of shape (batch_size, sequence_length).
             Typically, 1 indicates a valid (non-padding) token and 0 indicates a padding token.
 
     Returns:
-        torch.Tensor: 
+        torch.Tensor:
             A tensor of shape (batch_size, sequence_length) containing position IDs.
             - For non-padding tokens: position IDs start at 0 and increase consecutively.
             - For padding tokens: position ID is always 0.
@@ -84,64 +85,61 @@ def generate_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
     position_ids.masked_fill_(attention_mask == 0, 0)
     return position_ids
 
+
 def is_conversation(input_ids: torch.Tensor, tokenizer) -> bool:
     """
-    Check whether the given input IDs represent a conversation format.  
+    Check whether the given input IDs represent a conversation format.
     Only the first sample in the batch is inspected.
 
-    The function verifies whether the sequence contains at least one pair 
+    The function verifies whether the sequence contains at least one pair
     of special tokens: <|im_start|> and <|im_end|>.
 
     Args:
-        input_ids (torch.Tensor): 
+        input_ids (torch.Tensor):
             Tensor of shape (batch_size, seq_len) containing token IDs.
-        tokenizer: 
+        tokenizer:
             A HuggingFace tokenizer used to obtain the special token IDs.
 
     Returns:
-        bool: 
-            True if the sequence contains both <|im_start|> and <|im_end|>, 
+        bool:
+            True if the sequence contains both <|im_start|> and <|im_end|>,
             False otherwise.
     """
     if len(input_ids.shape) != 2:
         raise ValueError("input_ids must be a 2D tensor of shape (batch_size, seq_len)")
-    
+
     seq = input_ids[0].tolist()
 
     # Encode the special tokens to obtain their ID sequences
     im_start_ids = tokenizer.encode("<|im_start|>", add_special_tokens=False)
-    im_end_ids   = tokenizer.encode("<|im_end|>",   add_special_tokens=False)
+    im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
 
     # Check if the sequence contains at least one <|im_start|> and one <|im_end|>
-    has_start = any(seq[i:i+len(im_start_ids)] == im_start_ids for i in range(len(seq) - len(im_start_ids) + 1))
-    has_end   = any(seq[i:i+len(im_end_ids)]   == im_end_ids   for i in range(len(seq) - len(im_end_ids) + 1))
+    has_start = any(seq[i : i + len(im_start_ids)] == im_start_ids for i in range(len(seq) - len(im_start_ids) + 1))
+    has_end = any(seq[i : i + len(im_end_ids)] == im_end_ids for i in range(len(seq) - len(im_end_ids) + 1))
 
     return has_start and has_end
 
 
-def postprocess_assistant_labels(
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    tokenizer
-) -> torch.Tensor:
+def postprocess_assistant_labels(input_ids: torch.Tensor, labels: torch.Tensor, tokenizer) -> torch.Tensor:
     """
-    Mask out labels corresponding to the `<|im_start|>assistant` marker.  
+    Mask out labels corresponding to the `<|im_start|>assistant` marker.
 
     This ensures that the special tokens used to indicate the start of the assistant's
     response do not contribute to the loss during training.
 
     Args:
-        input_ids (torch.Tensor): 
+        input_ids (torch.Tensor):
             Tensor of shape (batch_size, seq_len) containing the conversation token IDs.
-        labels (torch.Tensor): 
-            Tensor of shape (batch_size, seq_len) containing training labels. 
+        labels (torch.Tensor):
+            Tensor of shape (batch_size, seq_len) containing training labels.
             A value of -100 indicates positions that should be ignored in loss computation.
-        tokenizer: 
+        tokenizer:
             A HuggingFace tokenizer used to encode the `<|im_start|>assistant\n` marker.
 
     Returns:
-        torch.Tensor: 
-            The modified labels tensor with positions corresponding to 
+        torch.Tensor:
+            The modified labels tensor with positions corresponding to
             `<|im_start|>assistant\n` masked as -100.
     """
     if tokenizer.chat_template != CONVERSATION_TEMPLATE:
@@ -151,7 +149,7 @@ def postprocess_assistant_labels(
             f"Got:\n{tokenizer.chat_template}\n\n"
             "Please ensure that you are using the correct conversation template."
         )
-    
+
     # Encode the token sequence for "<|im_start|>assistant\n"
     pattern_ids: List[int] = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
 
@@ -167,6 +165,7 @@ def postprocess_assistant_labels(
 
     return new_labels
 
+
 def check_ends_with_delimiter(
     input_ids: torch.Tensor, tokenizer: PreTrainedTokenizerBase, delimiters: List[str]
 ) -> torch.Tensor:
@@ -174,37 +173,52 @@ def check_ends_with_delimiter(
     Check whether each sequence in the batch ends with any of the specified delimiter strings.
 
     Args:
-        input_ids (torch.Tensor): 
+        input_ids (torch.Tensor):
             Tensor of shape (batch_size, seq_len) containing token IDs for each sequence.
-        tokenizer (PreTrainedTokenizerBase): 
+        tokenizer (PreTrainedTokenizerBase):
             HuggingFace tokenizer used to decode input_ids back to text.
-        delimiters (List[str]): 
-            A list of delimiter strings to check against. 
+        delimiters (List[str]):
+            A list of delimiter strings to check against.
             If a sequence ends with any of these delimiters, it is marked as True.
 
     Returns:
-        torch.Tensor: 
-            A boolean tensor of shape (batch_size, 1), where each entry indicates 
+        torch.Tensor:
+            A boolean tensor of shape (batch_size, 1), where each entry indicates
             whether the corresponding sequence ends with one of the delimiters.
     """
-    batch_size = input_ids.size(0)
+    batch_size, seq_len = input_ids.shape
+    device = input_ids.device
 
-    # Initialize result tensor: False by default
-    augmentation_decisions = torch.zeros(batch_size, 1, dtype=torch.bool, device=input_ids.device)
+    augmentation_decisions = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
 
-    # Decode token IDs to text sequences
-    decoded_inputs = tokenizer.batch_decode(input_ids)
+    delimiter_token_ids: Optional[List[List[int]]] = getattr(tokenizer, "_memgen_delimiter_token_ids", None)
+    if delimiter_token_ids is None or len(delimiter_token_ids) != len(delimiters):
+        delimiter_token_ids = [tokenizer.encode(delimiter, add_special_tokens=False) for delimiter in delimiters]
+        tokenizer._memgen_delimiter_token_ids = delimiter_token_ids  # type: ignore[attr-defined]
 
-    for i in range(batch_size):
-        ends_with_augment_str = False
-        # Check if the sequence ends with any of the given delimiters
-        for aug_str in delimiters:
-            if decoded_inputs[i].endswith(aug_str):
-                ends_with_augment_str = True
+    max_delimiter_token_len: Optional[int] = getattr(tokenizer, "_memgen_max_delimiter_token_len", None)
+    if max_delimiter_token_len is None or max_delimiter_token_len <= 0:
+        max_delimiter_token_len = max((len(ids) for ids in delimiter_token_ids if len(ids) > 0), default=1)
+        tokenizer._memgen_max_delimiter_token_len = max_delimiter_token_len  # type: ignore[attr-defined]
+
+    max_delimiter_token_len = max(1, max_delimiter_token_len)
+    tail_token_count = min(seq_len, max_delimiter_token_len)
+
+    for batch_idx in range(batch_size):
+        if tail_token_count == 0:
+            continue
+
+        tail_tokens = input_ids[batch_idx, seq_len - tail_token_count :]
+        if tail_tokens.numel() == 0:
+            continue
+
+        decoded_tail = tokenizer.decode(tail_tokens, skip_special_tokens=False)
+
+        for delimiter in delimiters:
+            if decoded_tail.endswith(delimiter):
+                augmentation_decisions[batch_idx, 0] = True
                 break
-        
-        augmentation_decisions[i] = ends_with_augment_str
-    
+
     return augmentation_decisions
 
 
@@ -212,17 +226,17 @@ def check_ends_with_delimiter(
 class LatentMemoryModel(BaseModel):
 
     def __init__(
-        self, 
-        reasoner_model_name: str, 
+        self,
+        reasoner_model_name: str,
         weaver_model_name: str,
         prompt_latents_len: int,
         inference_latents_len: int,
         weaver_peft_config: Optional[PeftConfig] = None,
-        trigger_model_name: str = None,   
+        trigger_model_name: str = None,
         trigger_peft_config: Optional[PeftConfig] = None,
-        max_prompt_aug_num: int = 1,     
+        max_prompt_aug_num: int = 1,
         max_inference_aug_num: int = 5,
-    ):   
+    ):
         super().__init__()
 
         # build reasoner LLM
@@ -231,20 +245,16 @@ class LatentMemoryModel(BaseModel):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(reasoner_model_name)
         self.config = self.model.config
-        
+
         # build weaver LLM
-        self.weaver = MemGenWeaver(
-            weaver_model_name, prompt_latents_len, inference_latents_len, weaver_peft_config
-        )
-        
+        self.weaver = MemGenWeaver(weaver_model_name, prompt_latents_len, inference_latents_len, weaver_peft_config)
+
         # build trigger LLM
-        self.trigger = NanoTrigger()   # always return true
+        self.trigger = NanoTrigger()  # always return true
         if trigger_model_name is not None:
-            self.trigger = MemGenTrigger(
-                trigger_model_name, trigger_peft_config
-            )
+            self.trigger = MemGenTrigger(trigger_model_name, trigger_peft_config)
             logging.info(f"Use Trigger: {trigger_model_name}")
-        
+
         # projection layers for mapping embeddings between reasoner and weaver
         # map reasoner input embeddings to weaver input embeddings
         self.reasoner_to_weaver = nn.Linear(
@@ -254,17 +264,30 @@ class LatentMemoryModel(BaseModel):
         self.weaver_to_reasoner = nn.Linear(
             self.weaver.config.hidden_size, self.model.config.hidden_size, dtype=torch.bfloat16
         )
-        
-        self.delimiters: List[str] = [",", ".", "\n"]  # delimiters for detecting augmentation points
+
+        self.delimiters: List[str] = [
+            ",",
+            ".",
+            "\n",
+        ]  # delimiters for detecting augmentation points
+        delimiter_token_ids: List[List[int]] = []
+        for delimiter in self.delimiters:
+            token_ids = self.tokenizer.encode(delimiter, add_special_tokens=False)
+            if len(token_ids) == 0:
+                logging.warning(f"Delimiter `{delimiter}` produced no tokens with the current tokenizer.")
+            delimiter_token_ids.append(token_ids)
+        self.tokenizer._memgen_delimiter_token_ids = delimiter_token_ids  # type: ignore[attr-defined]
+        max_delimiter_len = max((len(ids) for ids in delimiter_token_ids if len(ids) > 0), default=1)
+        self.tokenizer._memgen_max_delimiter_token_len = max_delimiter_len  # type: ignore[attr-defined]
         self.max_prompt_aug_num = max_prompt_aug_num  # insert latents after input prompt
         self.max_inference_aug_num = max_inference_aug_num  # insert latents after specified delimiters
 
         # postprocess
         self._postprocess_models()
-        
+
         self.warnings_issued = {}
         self.model_tags = None
-        log_trainable_params(self)
+        # log_trainable_params(self)
 
     def add_model_tags(self, tags: Union[list[str], str]) -> None:
         r"""
@@ -297,7 +320,7 @@ class LatentMemoryModel(BaseModel):
         for tag in tags:
             if tag not in self.model_tags:
                 self.model_tags.append(tag)
-    
+
     def _postprocess_models(self):
         """
         Postprocess the components of the latent memory model: reasoner, weaver, trigger, and tokenizer.
@@ -323,9 +346,7 @@ class LatentMemoryModel(BaseModel):
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             self.tokenizer.padding_side = "left"
-            logging.info(
-                f"Tokenizer has no pad token. Using EOS token ({self.tokenizer.eos_token}) as pad token."
-            )
+            logging.info(f"Tokenizer has no pad token. Using EOS token ({self.tokenizer.eos_token}) as pad token.")
 
         # Normalize the tokenizer's chat template
         self.tokenizer.chat_template = CONVERSATION_TEMPLATE
@@ -334,22 +355,20 @@ class LatentMemoryModel(BaseModel):
     def device(self):
         assert self.model.device == self.weaver.device == self.trigger.device
         return self.model.device
-    
+
     def _forward(
-        self, 
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,   
-        **kwargs
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         # preprocess inputs
         assert input_ids.shape == attention_mask.shape == labels.shape
-        
+
         tokenizer = self.tokenizer
         reasoner = self.model
         weaver = self.weaver
         delimiters = self.delimiters
-        max_augment_num = self.max_inference_aug_num  # Limit the number of inference augmentation points to avoid excessive augmentation
+        max_augment_num = (
+            self.max_inference_aug_num
+        )  # Limit the number of inference augmentation points to avoid excessive augmentation
         device = self.device
         embeds_dtype = reasoner.get_input_embeddings().weight.dtype
         B, _ = input_ids.shape
@@ -359,10 +378,10 @@ class LatentMemoryModel(BaseModel):
         augmentation_indices = self._select_augment_points_after_delimiter(
             input_ids, labels, delimiters, tokenizer, max_augment_num
         )
-        
+
         # origin inputs embeds
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
-                
+
         # Initialize the start index and empty tensors for accumulating processed segments
         current_start_idx = 0
         current_inputs_embeds = torch.empty((B, 0, hidden_size), device=device, dtype=embeds_dtype)
@@ -386,7 +405,9 @@ class LatentMemoryModel(BaseModel):
             weaver_inputs_embeds = self.reasoner_to_weaver(current_inputs_embeds)
 
             # Determine whether this point is the end of the prompt (prompt augmentation)
-            is_prompt_end_aug = (labels[:, aug_point_idx] != -100).all() and (labels[:, aug_point_idx-1] == -100).all().item()
+            is_prompt_end_aug = (labels[:, aug_point_idx] != -100).all() and (
+                labels[:, aug_point_idx - 1] == -100
+            ).all().item()
             # Depending on type, use weaver to augment prompt or inference
             if is_prompt_end_aug:
                 weaver_hidden_states, attn_mask, pos_ids = weaver.augment_prompt(
@@ -395,7 +416,7 @@ class LatentMemoryModel(BaseModel):
             else:
                 weaver_hidden_states, attn_mask, pos_ids = weaver.augment_inference(
                     weaver_inputs_embeds, current_attention_mask, current_position_ids
-                ) 
+                )
 
             # Map weaver hidden states back to reasoner embeddings
             latent_inputs_embeds = self.weaver_to_reasoner(weaver_hidden_states)
@@ -404,16 +425,16 @@ class LatentMemoryModel(BaseModel):
             current_inputs_embeds = torch.cat([current_inputs_embeds, latent_inputs_embeds], dim=1)
             current_attention_mask = torch.cat([current_attention_mask, attn_mask], dim=1)
             current_start_idx = aug_point_idx
-            
+
             # Update latent mask for the newly added latent embeddings
             latent_mask = torch.ones((B, latent_inputs_embeds.size(1)), device=device, dtype=torch.bool)
             current_latents_mask = torch.cat([current_latents_mask, latent_mask], dim=1)
-            
+
         # Process the remaining segment after the last augmentation point
         remaining_inputs_embeds = inputs_embeds[:, current_start_idx:]
         remaining_attention_mask = attention_mask[:, current_start_idx:]
         latent_mask = torch.zeros((B, remaining_attention_mask.size(1)), device=device, dtype=torch.bool)
-        
+
         current_inputs_embeds = torch.cat([current_inputs_embeds, remaining_inputs_embeds], dim=1)
         current_attention_mask = torch.cat([current_attention_mask, remaining_attention_mask], dim=1)
         current_position_ids = generate_position_ids(current_attention_mask)
@@ -422,26 +443,22 @@ class LatentMemoryModel(BaseModel):
         reasoner_outputs = reasoner(
             inputs_embeds=current_inputs_embeds,
             attention_mask=current_attention_mask,
-            position_ids=current_position_ids
+            position_ids=current_position_ids,
         )
         logits = reasoner_outputs.logits
-        
+
         # Identify valid positions in logits (positions that should contribute to loss)
         shifted = torch.zeros_like(current_latents_mask)
         shifted[:, :-1] = current_latents_mask[:, 1:]
         valid_mask = ~shifted
-        
-        valid_logits = logits[valid_mask].view(logits.size(0), -1, logits.size(2))  
+
+        valid_logits = logits[valid_mask].view(logits.size(0), -1, logits.size(2))
         # assert shifted.sum() == current_latents_mask.sum()
         # assert valid_logits.shape[:2] == input_ids.shape
         return valid_logits
-    
+
     def _instructional_forward(
-        self, 
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,   
-        **kwargs
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for single-turn instructional data (no multi-turn conversation required).
@@ -457,7 +474,7 @@ class LatentMemoryModel(BaseModel):
             **kwargs: Additional keyword arguments passed to `_forward`.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: 
+            Tuple[torch.Tensor, torch.Tensor]:
                 - logits: The output logits from the model for each input token.
                 - labels: The same as input labels, used for loss computation.
         """
@@ -466,11 +483,7 @@ class LatentMemoryModel(BaseModel):
         return logits, labels
 
     def _conversational_forward(
-        self, 
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,   
-        **kwargs
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for conversational (multi-turn) data.
@@ -504,18 +517,18 @@ class LatentMemoryModel(BaseModel):
         valid_mask = should_supervise.int()
         diff = torch.diff(torch.cat([torch.tensor([0], device=device), valid_mask]))
         valid_starts = (diff == 1).nonzero(as_tuple=True)[0].tolist()  # Transition 0 -> 1
-        ends = (diff == -1).nonzero(as_tuple=True)[0].tolist()          # Transition 1 -> 0
+        ends = (diff == -1).nonzero(as_tuple=True)[0].tolist()  # Transition 1 -> 0
         if len(ends) < len(valid_starts):
             ends.append(seq_len)
         assert len(valid_starts) == len(ends)
-        
+
         # Build triplets (start of previous segment, start of supervised segment, end of supervised segment)
         triplets = []
         start = 0
         for s, e in zip(valid_starts, ends):
             triplets.append((start, s, e))
             start = e
-        
+
         # If there are more segments than allowed, randomly select self.max_prompt_aug_num segments
         if len(triplets) <= self.max_prompt_aug_num:
             select_turns = [1] * len(triplets)
@@ -540,7 +553,7 @@ class LatentMemoryModel(BaseModel):
 
                 # Single-turn forward for the current conversation segment
                 logits = self._forward(cur_input_ids, cur_attention, cur_labels, **kwargs)
-                
+
                 # Update overall logits and labels with the results of this segment
                 all_logits[0, start:end, :] = logits[0, start:end, :]
                 all_labels[0, start:end] = labels[0, start:end]
@@ -550,45 +563,39 @@ class LatentMemoryModel(BaseModel):
         # - unsupervised positions have logits = 0 and labels = -100
         return all_logits, all_labels
 
-    def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
-        **kwargs
-    ):  
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, **kwargs):
         tokenizer = self.tokenizer
 
         # Ensure labels are provided, required for training the reasoning processor
         assert labels is not None, "Reasoning Processor requires input labels for training"
-        
+
         # Determine whether the input is single-turn (instruction) or multi-turn (conversation)
         forward_func = self._instructional_forward
         if is_conversation(input_ids, tokenizer):
             # For conversational data, mask assistant tokens in labels
             labels = postprocess_assistant_labels(input_ids, labels, tokenizer)
             forward_func = self._conversational_forward
-        
+
         batch_size = 1  # Currently process one sequence per batch
         iter_num = input_ids.size(0) // batch_size
 
         # Forward pass per batch
         logits, supervised_labels = [], []
         for i in range(iter_num):
-            batch_input_ids = input_ids[i * batch_size: (i + 1) * batch_size]
-            batch_attention_mask = attention_mask[i * batch_size: (i + 1) * batch_size]
-            batch_labels = labels[i * batch_size: (i + 1) * batch_size]
+            batch_input_ids = input_ids[i * batch_size : (i + 1) * batch_size]
+            batch_attention_mask = attention_mask[i * batch_size : (i + 1) * batch_size]
+            batch_labels = labels[i * batch_size : (i + 1) * batch_size]
 
             # Call the appropriate forward function (instruction or conversation)
             batch_logits, batch_supervised_labels = forward_func(
                 input_ids=batch_input_ids,
                 attention_mask=batch_attention_mask,
                 labels=batch_labels,
-                **kwargs
+                **kwargs,
             )
             logits.append(batch_logits)
             supervised_labels.append(batch_supervised_labels)
-        
+
         # Concatenate results from all batches
         all_logits = torch.concat(logits, dim=0)
         all_labels = torch.concat(supervised_labels, dim=0)
@@ -605,17 +612,16 @@ class LatentMemoryModel(BaseModel):
         outputs.supervised_labels = all_labels  # Positions in input_ids that are supervised
         return outputs
 
-    
     @torch.no_grad()
     def generate(
-        self, 
-        input_ids: torch.Tensor, 
+        self,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         generation_config: GenerationConfig = None,
         return_augmentation_mask: bool = False,
-        **kwargs
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: 
-        
+        **kwargs,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
         tokenizer = self.tokenizer
         reasoner = self.model
         weaver = self.weaver
@@ -629,7 +635,7 @@ class LatentMemoryModel(BaseModel):
         attention_mask = attention_mask.to(self.device)
         max_new_tokens = generation_config.max_new_tokens
         do_sample = generation_config.do_sample
-        temperature = generation_config.temperature    # control reasoner generate and trigger generate
+        temperature = generation_config.temperature  # control reasoner generate and trigger generate
         pad_token_id = tokenizer.pad_token_id
         eos_token_id = tokenizer.eos_token_id
         prompt_len = input_ids.size(1)
@@ -638,7 +644,7 @@ class LatentMemoryModel(BaseModel):
             temperature=temperature,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
-            use_cache=True
+            use_cache=True,
         )
 
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
@@ -649,7 +655,7 @@ class LatentMemoryModel(BaseModel):
         current_attention_mask = attention_mask
         current_position_ids = generate_position_ids(current_attention_mask)
         current_input_ids = input_ids
-        
+
         weaver_inputs_embeds = self.reasoner_to_weaver(current_inputs_embeds)
         weaver_hidden_states, attn_mask, pos_ids = weaver.augment_prompt(
             weaver_inputs_embeds, current_attention_mask, current_position_ids
@@ -666,10 +672,10 @@ class LatentMemoryModel(BaseModel):
         augmentation_pos = torch.full((B, max_new_tokens), fill_value=invalid_token_id, device=device)
         inserted_embeds: List[List[torch.Tensor]] = [[] for _ in range(B)]
         for i in range(max_new_tokens):
-            
+
             # If all sequences in the batch have already generated an EOS token, stop early
             if (current_input_ids[:, -1] == eos_token_id).all():
-                break   
+                break
 
             # Check if all sequences have reached the maximum number of augmentations
             if (sentence_augment_count >= max_augment_num).all():
@@ -691,17 +697,28 @@ class LatentMemoryModel(BaseModel):
                 position_ids=current_position_ids,
                 output_hidden_states=False,
             )
-            current_inputs_embeds, current_attention_mask, current_position_ids, current_input_ids = self._append_one_step(
-                outputs, current_inputs_embeds, current_attention_mask, current_position_ids, current_input_ids, do_sample, temperature
+            current_inputs_embeds, current_attention_mask, current_position_ids, current_input_ids = (
+                self._append_one_step(
+                    outputs,
+                    current_inputs_embeds,
+                    current_attention_mask,
+                    current_position_ids,
+                    current_input_ids,
+                    do_sample,
+                    temperature,
+                )
             )
- 
-            if i == max_new_tokens - 1:  
-                break 
+
+            if i == max_new_tokens - 1:
+                break
 
             # Determine which sentences in the batch should be augmented
             augment_decision = self._should_augment(
-                current_input_ids, current_attention_mask, sentence_augment_count=sentence_augment_count, 
-                do_sample=do_sample, temperature=temperature  
+                current_input_ids,
+                current_attention_mask,
+                sentence_augment_count=sentence_augment_count,
+                do_sample=do_sample,
+                temperature=temperature,
             )
             augmentation_pos[:, i + 1] = augment_decision
             augment_indices = torch.where(augment_decision == 1)[0]
@@ -715,55 +732,59 @@ class LatentMemoryModel(BaseModel):
                 candidate_inputs_embeds = current_inputs_embeds[augment_indices]
                 candidate_attention_mask = current_attention_mask[augment_indices]
                 candidate_position_ids = current_position_ids[augment_indices]
-                
+
                 # Perform inference augmentation using the weaver
                 weaver_inputs_embeds = self.reasoner_to_weaver(candidate_inputs_embeds)
                 weaver_hidden_states, attn_mask, _ = weaver.augment_inference(
                     weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
                 )
                 latent_inputs_embeds = self.weaver_to_reasoner(weaver_hidden_states)
-                
+
                 candidate_inputs_embeds = torch.cat([candidate_inputs_embeds, latent_inputs_embeds], dim=1)
                 candidate_attention_mask = torch.cat([candidate_attention_mask, attn_mask], dim=1)
-                
+
                 # Create a single merged tensor for all sequences
                 new_len = candidate_inputs_embeds.size(1)
-                merged_inputs_embeds = torch.zeros((B, new_len, hidden_size), device=device, dtype=current_inputs_embeds.dtype)
+                merged_inputs_embeds = torch.zeros(
+                    (B, new_len, hidden_size), device=device, dtype=current_inputs_embeds.dtype
+                )
                 merged_attention_mask = torch.zeros((B, new_len), device=device, dtype=current_attention_mask.dtype)
-                
+
                 # Directly place augmented and non-augmented sequences
                 merged_inputs_embeds[augment_indices] = candidate_inputs_embeds
                 merged_attention_mask[augment_indices] = candidate_attention_mask
-                
+
                 # Non-augmented sequences now include both -100 and 0
                 non_augment_indices = torch.where(augment_decision != 1)[0]
                 if len(non_augment_indices) > 0:
                     non_aug_inputs_embeds = current_inputs_embeds[non_augment_indices]
                     non_aug_attention_mask = current_attention_mask[non_augment_indices]
                     non_aug_inputs_embeds, non_aug_attention_mask, _ = self._left_pad(
-                        non_aug_inputs_embeds, non_aug_attention_mask, None, weaver.inference_latents_num
+                        non_aug_inputs_embeds,
+                        non_aug_attention_mask,
+                        None,
+                        weaver.inference_latents_num,
                     )
                     merged_inputs_embeds[non_augment_indices] = non_aug_inputs_embeds
                     merged_attention_mask[non_augment_indices] = non_aug_attention_mask
-                
+
                 current_inputs_embeds = merged_inputs_embeds
                 current_attention_mask = merged_attention_mask
                 current_position_ids = generate_position_ids(current_attention_mask)
-                
+
                 # Record inserted embeds for post-processing
                 for idx, embed in zip(augment_indices, latent_inputs_embeds):
                     inserted_embeds[idx].append(embed.clone().detach().cpu())
-        
+
         # postprocess
         new_generated_len = current_input_ids.size(1) - prompt_len
         augmentation_pos = augmentation_pos[:, :new_generated_len]
-         
+
         if not return_augmentation_mask:
             return current_input_ids
         else:
             return current_input_ids, augmentation_pos
 
-    
     @classmethod
     def from_config(cls, config):
         # reasoner configs
@@ -779,9 +800,9 @@ class LatentMemoryModel(BaseModel):
         weaver_use_peft = weaver_configs.get("use_peft", True)
         weaver_peft_config = weaver_configs.get("peft_config", None) if weaver_use_peft else None
 
-        if weaver_peft_config is not None:  
+        if weaver_peft_config is not None:
             weaver_peft_config = LoraConfig(**weaver_peft_config)
-        
+
         # trigger configs
         trigger_configs = config.get("trigger")
         trigger_model_name = trigger_configs.get("trigger_model_name", None)
@@ -803,7 +824,7 @@ class LatentMemoryModel(BaseModel):
             trigger_peft_config=trigger_peft_config,
             # augmentations
             max_prompt_aug_num=max_prompt_aug_num,
-            max_inference_aug_num=max_inference_aug_num
+            max_inference_aug_num=max_inference_aug_num,
         )
 
         # load model state dict
@@ -814,41 +835,45 @@ class LatentMemoryModel(BaseModel):
             logging.info(f"Load model state dict from: {load_model_path}")
 
         return model
-    
 
     @torch.no_grad()
     def _append_one_step(
         self,
-        reasoner_outputs, 
+        reasoner_outputs,
         current_inputs_embeds: torch.Tensor,
         current_attention_mask: torch.Tensor,
         current_position_ids: torch.Tensor,
         current_input_ids: torch.Tensor,
         do_sample: bool,
-        temperature: float
+        temperature: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         reasoner = self.model
         B = current_inputs_embeds.size(0)
-        
+
         # Append next token
         next_token_logits = reasoner_outputs.logits[:, -1]
         next_token_ids = get_next_token(next_token_logits, do_sample, temperature)
         current_input_ids = torch.cat([current_input_ids, next_token_ids], dim=1)
-        
+
         # Append next token embeds
         next_token_embeds = reasoner.get_input_embeddings()(next_token_ids)
         current_inputs_embeds = torch.cat([current_inputs_embeds, next_token_embeds], dim=1)
-        
+
         # Append attention mask
         attn_mask = torch.ones((B, 1), dtype=current_attention_mask.dtype, device=current_attention_mask.device)
         current_attention_mask = torch.cat([current_attention_mask, attn_mask], dim=1)
-        
+
         # Append position ids
         next_position_id = current_position_ids[:, -1:] + 1
         current_position_ids = torch.cat([current_position_ids, next_position_id], dim=1)
 
-        return current_inputs_embeds, current_attention_mask, current_position_ids, current_input_ids
-    
+        return (
+            current_inputs_embeds,
+            current_attention_mask,
+            current_position_ids,
+            current_input_ids,
+        )
+
     def _select_augment_points_after_delimiter(
         self,
         input_ids: torch.Tensor,
@@ -899,7 +924,7 @@ class LatentMemoryModel(BaseModel):
                 # Assume check_ends_with_delimiter is defined
                 if any(check_ends_with_delimiter(batch_tokens_before_i, tokenizer, delimiters)):
                     inference_augment_idx.append(i)
-        
+
         # Ensure exactly one prompt augmentation point exists for single-turn processing
         if len(prompt_augment_idx) != 1:
             raise ValueError("Single-turn forward must have exactly one prompt augment index")
@@ -911,21 +936,21 @@ class LatentMemoryModel(BaseModel):
             inference_augment_idx = inference_augment_idx[:max_num]
 
         final_points.extend(inference_augment_idx)
-        
+
         if len(final_points) == 0:
             raise RuntimeError("No valid augmentation points found")
-        
+
         final_points.sort()
         return final_points
 
     @torch.no_grad()
     def _should_augment(
-        self, 
-        input_ids, 
-        attention_mask, 
-        sentence_augment_count: torch.Tensor, 
-        do_sample: bool, 
-        temperature: float = 0.0
+        self,
+        input_ids,
+        attention_mask,
+        sentence_augment_count: torch.Tensor,
+        do_sample: bool,
+        temperature: float = 0.0,
     ) -> torch.Tensor:
         """
         Determine whether each sentence in the batch should be augmented based on
@@ -961,7 +986,7 @@ class LatentMemoryModel(BaseModel):
         aug_mask[ends_with_delimiters] = 0
 
         # If a sentence has already reached the max augmentation count, reset to -100
-        over_limit = (sentence_augment_count >= max_augment_num)
+        over_limit = sentence_augment_count >= max_augment_num
         aug_mask[over_limit] = -100
 
         # Apply trigger model only on sentences that are candidates (aug_mask != -100)
@@ -981,33 +1006,32 @@ class LatentMemoryModel(BaseModel):
 
         return aug_mask
 
-    
     @torch.no_grad()
     def _left_pad(
         self,
         input_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        pad_num: int
+        pad_num: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        
+
         if input_embeds is not None:
             B, L, D = input_embeds.shape
             pad_embeds = torch.zeros((B, pad_num, D), dtype=input_embeds.dtype, device=input_embeds.device)
             input_embeds = torch.cat([pad_embeds, input_embeds], dim=1)  # [B, pad_num + L, D]
-        
+
         if attention_mask is not None:
             B = attention_mask.size(0)
             pad_mask = torch.zeros((B, pad_num), dtype=attention_mask.dtype, device=attention_mask.device)
             attention_mask = torch.cat([pad_mask, attention_mask], dim=1)  # [B, pad_num + L]
-        
+
         if position_ids is not None:
             B = position_ids.size(0)
             pad_pos = torch.zeros((B, pad_num), dtype=position_ids.dtype, device=position_ids.device)
             position_ids = torch.cat([pad_pos, position_ids], dim=1)  # [B, pad_num + L]
 
         return input_embeds, attention_mask, position_ids
-    
+
     @torch.no_grad()
     def _left_clip_pad_tokens(
         self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, position_ids: torch.Tensor
@@ -1026,7 +1050,7 @@ class LatentMemoryModel(BaseModel):
             position_ids (torch.Tensor): Position IDs of shape (B, L)
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 Trimmed inputs_embeds, attention_mask, and position_ids
         """
         B, L, D = inputs_embeds.shape
@@ -1041,7 +1065,7 @@ class LatentMemoryModel(BaseModel):
                 first_nonpad_idx.append(L)
             else:
                 first_nonpad_idx.append(nonzero[0].item())
-        
+
         # Determine the minimum number of left-padding tokens across the batch
         min_pad = min(first_nonpad_idx)
 
@@ -1055,4 +1079,3 @@ class LatentMemoryModel(BaseModel):
         position_ids = position_ids[:, min_pad:]
 
         return inputs_embeds, attention_mask, position_ids
-
