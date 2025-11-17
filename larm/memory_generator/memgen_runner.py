@@ -1,4 +1,5 @@
 import os
+import logging
 from torch.utils.data import DataLoader
 from datasets import Dataset
 from accelerate import Accelerator
@@ -47,6 +48,8 @@ class LatentMemoryRunner(BaseRunner):
             configs,
             env_and_gens_dict
         )
+        # save load_model_path for checkpoint resuming
+        self.load_model_path = configs.model_cfg.get("load_model_path", None)
         # parse configs
         self._parse_configs(configs.run_cfg)
 
@@ -159,7 +162,30 @@ class LatentMemoryRunner(BaseRunner):
 
         # train weaver
         weaver_trainer = self._create_weaver_trainer()
-        weaver_trainer.train()
+
+        # Check if we should resume from checkpoint
+        resume_from_checkpoint = None
+        if self.load_model_path is not None and self.load_model_path != "null":
+            # Check if it's a directory (full checkpoint) or a file (model weights only)
+            if os.path.isdir(self.load_model_path):
+                # It's a checkpoint directory, use it to resume training
+                resume_from_checkpoint = self.load_model_path
+                logging.info(f"Resuming training from checkpoint directory: {resume_from_checkpoint}")
+            elif os.path.isfile(self.load_model_path):
+                # If it's a file, model weights are already loaded in memgen_model.from_config
+                # We can continue training from the loaded weights (but optimizer/scheduler states are reset)
+                logging.info(
+                    f"Model weights loaded from: {self.load_model_path}. Training will continue from loaded weights."
+                )
+            else:
+                logging.warning(
+                    f"load_model_path '{self.load_model_path}' is neither a file nor a directory. Starting training from scratch."
+                )
+
+        if resume_from_checkpoint:
+            weaver_trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        else:
+            weaver_trainer.train()
         weaver_trainer.save_model()   # save the best model
 
         # remove checkpoints and save weaver
@@ -196,7 +222,30 @@ class LatentMemoryRunner(BaseRunner):
 
         # train trigger
         trigger_trainer = self._create_trigger_trainer()
-        trigger_trainer.train()
+
+        # Check if we should resume from checkpoint
+        resume_from_checkpoint = None
+        if self.load_model_path is not None and self.load_model_path != "null":
+            # Check if it's a directory (full checkpoint) or a file (model weights only)
+            if os.path.isdir(self.load_model_path):
+                # It's a checkpoint directory, use it to resume training
+                resume_from_checkpoint = self.load_model_path
+                logging.info(f"Resuming training from checkpoint directory: {resume_from_checkpoint}")
+            elif os.path.isfile(self.load_model_path):
+                # If it's a file, model weights are already loaded in memgen_model.from_config
+                # We can continue training from the loaded weights (but optimizer/scheduler states are reset)
+                logging.info(
+                    f"Model weights loaded from: {self.load_model_path}. Training will continue from loaded weights."
+                )
+            else:
+                logging.warning(
+                    f"load_model_path '{self.load_model_path}' is neither a file nor a directory. Starting training from scratch."
+                )
+
+        if resume_from_checkpoint:
+            trigger_trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        else:
+            trigger_trainer.train()
         trigger_trainer.save_model()     # save the best model
 
         # remove checkpoints and save weaver

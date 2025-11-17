@@ -11,6 +11,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import PeftConfig, LoraConfig
 
 import random
+import os
 from typing import Tuple, Optional, List, Union
 import logging
 
@@ -830,9 +831,19 @@ class LatentMemoryModel(BaseModel):
         # load model state dict
         load_model_path = config.get("load_model_path", None)
         if load_model_path is not None:
-            model_state_dict = load_state_dict_from_safetensor(load_model_path)
-            model.load_state_dict(model_state_dict, strict=False)
-            logging.info(f"Load model state dict from: {load_model_path}")
+            # Only load from file (safetensors), not from checkpoint directory
+            # Checkpoint directories are handled in the trainer
+            if os.path.isfile(load_model_path):
+                model_state_dict = load_state_dict_from_safetensor(load_model_path)
+                model.load_state_dict(model_state_dict, strict=False)
+                logging.info(f"Load model state dict from: {load_model_path}")
+            elif os.path.isdir(load_model_path):
+                # If it's a directory, it's a checkpoint directory and will be handled by trainer
+                logging.info(f"Checkpoint directory detected: {load_model_path}. Will be handled by trainer.")
+            else:
+                logging.warning(
+                    f"load_model_path '{load_model_path}' is neither a file nor a directory. Skipping model loading."
+                )
 
         return model
 

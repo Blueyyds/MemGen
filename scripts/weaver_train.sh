@@ -33,16 +33,16 @@ PROMPT_LATENTS_LEN=8
 INFERENCE_LATENTS_LEN=8
 
 # Trained weaver model path: 
-# - Must point to a checkpoint file ending with .safetensors (e.g. <output_dir>/model.safetensors)
-# - If specified, training will resume from this checkpoint;  
-# - if set to "null", training starts from scratch.  
-LOAD_WEAVER_PATH=null
+# - Can point to a checkpoint directory (e.g. <output_dir>/checkpoint-100) to resume training with full state
+# - Can point to a checkpoint file ending with .safetensors (e.g. <output_dir>/model.safetensors) to load weights and continue training
+# - If set to "null", training starts from scratch.  
+LOAD_WEAVER_PATH="results/weaver/gsm8k_grpo/Qwen/Qwen2.5-1.5B-Instruct/20251116-233637/weaver/checkpoint-500"
 CURRENT_TIME=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="results/weaver/${DATASET_NAME}_${TRAIN_METHOD}/${REASONER_MODEL}/${CURRENT_TIME}"
 
 # Wandb configs
 WANDB_PROJECT="memgen"  # wandb 项目名称
-WANDB_RUN_NAME="weaver_${DATASET_NAME}_${TRAIN_METHOD}_${REASONER_MODEL}_${CURRENT_TIME}"  # wandb 运行名称
+WANDB_RUN_NAME="H100_weaver_${DATASET_NAME}_${TRAIN_METHOD}_${REASONER_MODEL}_${CURRENT_TIME}"  # wandb 运行名称
 
 # train
 uv run -m accelerate.commands.launch \

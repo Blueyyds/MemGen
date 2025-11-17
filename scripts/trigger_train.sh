@@ -32,8 +32,9 @@ PROMPT_LATENTS_LEN=8
 INFERENCE_LATENTS_LEN=8
 
 # Trained weaver model path: 
-# - Must point to a checkpoint file ending with .safetensors (e.g. <output_dir>/model.safetensors)
-# - Required when training the trigger (a pre-trained weaver model must exist)
+# - Can point to a checkpoint directory (e.g. <output_dir>/checkpoint-100) to resume training with full state
+# - Can point to a checkpoint file ending with .safetensors (e.g. <output_dir>/model.safetensors) to load weights and continue training
+# - If set to "null", training starts from scratch.  
 LOAD_WEAVER_PATH="results/weaver/gsm8k_sft/Qwen/Qwen2.5-1.5B-Instruct/20251114-092434/weaver/model.safetensors"
 CURRENT_TIME=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="results/trigger/${DATASET_NAME}_${TRAIN_METHOD}/${REASONER_MODEL}/${CURRENT_TIME}"
