@@ -15,9 +15,8 @@ Unlike traditional approaches, MemGen generates latent memory tokens directly wi
 
 Create and activate the MemGen environment from the provided YAML file:
 
-```
-conda env create -f memgen.yaml
-conda activate MemGen
+```bash
+uv sync
 ```
 
 ## 🚀 Quick Start
