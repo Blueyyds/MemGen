@@ -58,7 +58,7 @@ class LatentMemoryRunner(BaseRunner):
         self.weaver_train_dataset, self.trigger_train_dataset = self._parse_train_dataset(self.dataset_dict["train"])
         self.valid_dataset = self.dataset_dict["valid"]
         self.test_dataset = self.dataset_dict["test"]
-        
+
         self.weaver_train_dataset = self._filter_dataset(self.weaver_train_dataset)
         self.trigger_train_dataset = self._filter_dataset(self.trigger_train_dataset)
         self.valid_dataset = self._filter_dataset(self.valid_dataset)
@@ -67,7 +67,7 @@ class LatentMemoryRunner(BaseRunner):
         self.generation_manager: InteractionManager = self.gen_cls(
             self.processing_class, self.model, self.interaction_config
         )
-    
+
     def _parse_train_dataset(self, train_dataset: Dataset) -> Tuple[Dataset, Dataset]:
         trigger_trainset_size = min(500, len(train_dataset))
         return train_dataset, train_dataset.select(range(trigger_trainset_size))
@@ -115,7 +115,7 @@ class LatentMemoryRunner(BaseRunner):
         dataset = dataset.filter(filter_func)
 
         return dataset
-    
+
     # ===== train weaver =====
     def _create_weaver_trainer(self):
 
@@ -128,14 +128,14 @@ class LatentMemoryRunner(BaseRunner):
                 eval_dataset=self.valid_dataset,
                 processing_class=self.processing_class,
             )
-        
+
         # GRPO Trainer
         elif self.train_weaver_method == 'grpo':
-            
+
             reward_funcs = []     # get reward funcs for GRPO Trainer
             for reward_name in self.weaver_reward_names:
                 reward_funcs.append(self.env_cls.get_reward_func(reward_name))
-            
+
             weaver_trainer = WeaverGRPOTrainer(
                 model=self.model,
                 reward_funcs=reward_funcs,
@@ -156,28 +156,27 @@ class LatentMemoryRunner(BaseRunner):
 
         # fix trigger parameters
         fix_model_parameters(self.model.trigger)
-        
+
         # train weaver
         weaver_trainer = self._create_weaver_trainer()
         weaver_trainer.train()
         weaver_trainer.save_model()   # save the best model
-        
+
         # remove checkpoints and save weaver
         output_dir = weaver_trainer.args.output_dir
         self._remove_trainer_ckpts(output_dir)
-        
+
         # open trigger parameters
         open_model_parameters(self.model.trigger)
-    
-    
+
     # ===== train trigger =====
     def _create_trigger_trainer(self):
-        
+
         # get reward funcs for RL Trainer
         reward_funcs = [] 
         for reward_name in self.trigger_reward_names:
             reward_funcs.append(self.env_cls.get_reward_func(reward_name))
-        
+
         # build trainer
         trigger_trainer = TriggerGRPOTrainer(
             model=self.model, 
@@ -189,7 +188,7 @@ class LatentMemoryRunner(BaseRunner):
         )
 
         return trigger_trainer
-    
+
     def _train_trigger(self):
 
         # fix weaver parameters
@@ -203,26 +202,26 @@ class LatentMemoryRunner(BaseRunner):
         # remove checkpoints and save weaver
         output_dir = trigger_trainer.args.output_dir
         self._remove_trainer_ckpts(output_dir)
-        
+
         # open trigger parameters
         open_model_parameters(self.model.weaver)
-    
+
     # ===== train weaver/trigger =====
     def train(self):
         # train weaver
         if self.train_weaver:
             self._train_weaver()
-        
+
         # train trigger
         if self.train_trigger:
             self._train_trigger()
-    
+
     # ===== evaluate =====
     def _static_evaluate(self):
-        
+
         accelerator = Accelerator()
         writer = self._create_tensorboard(mode="evaluate")
-        
+
         batch_size = self.eval_config.batch_size
         output_dir = self.eval_config.output_dir
         generation_config = self.eval_config.generation_config
@@ -239,12 +238,12 @@ class LatentMemoryRunner(BaseRunner):
         # prepare model
         model_wrapped = accelerator.prepare_model(model=self.model, evaluation_mode=True)
         model_wrapped.eval()
-        
+
         # construct eval recorder
         test_funcs = [self.env_cls.get_reward_func("accuracy")]
         save_file = os.path.join(output_dir, "answer.json")
         recorder = StaticEvalRecorder(compute_metrics=test_funcs, writer=writer, log_file=save_file)
-        
+
         # batch generation
         for test_batch in tqdm(test_dataloader):
             with unwrap_model_for_generation(
@@ -264,7 +263,7 @@ class LatentMemoryRunner(BaseRunner):
                 # generation manager
                 self.generation_manager.actor_rollout_wg = unwrapped_model
                 gen_output = self.generation_manager.run_agent_loop(gen_batch)
-            
+
                 # postprocess: 由 generation manager 保证 completion ids 的正确性
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -274,9 +273,8 @@ class LatentMemoryRunner(BaseRunner):
         recorder.finalize()
         writer.close()
 
-
     def _dynamic_evaluate(self):
-        
+
         def _set_batch_envs(batch: List) -> Tuple[List[str], List[str], List]:  # batch set envs
             system_prompts, init_user_prompts, envs = [], [], []
             for task_config in batch:
@@ -286,9 +284,9 @@ class LatentMemoryRunner(BaseRunner):
                 system_prompts.append(system_prompt)
                 init_user_prompts.append(init_user_prompt)
                 envs.append(env)
-            
+
             return system_prompts, init_user_prompts, envs
-        
+
         def _build_data_proto(
             system_prompts: List[str], init_user_prompts: List[str], envs: List
         ) -> InteractionDataProto:
@@ -304,7 +302,7 @@ class LatentMemoryRunner(BaseRunner):
             data_proto.no_tensor_batch["envs"] = envs
 
             return data_proto
-        
+
         # ===== body =====
         output_dir = self.eval_config.output_dir
 
@@ -316,7 +314,7 @@ class LatentMemoryRunner(BaseRunner):
         batch_size = self.eval_config.batch_size
         generation_config = self.eval_config.generation_config
         generation_config.eos_token_id = self.processing_class.eos_token_id
-        
+
         # prepare dataset and dataloader
         test_dataloader = accelerator.prepare(DataLoader(
             dataset=self.test_dataset, 
@@ -328,7 +326,7 @@ class LatentMemoryRunner(BaseRunner):
         # prepare model
         model_wrapped = accelerator.prepare_model(model=self.model, evaluation_mode=True)
         model_wrapped.eval()
-        
+
         # batch generate
         for step, test_batch in tqdm(enumerate(test_dataloader)):
             with unwrap_model_for_generation(
@@ -336,10 +334,10 @@ class LatentMemoryRunner(BaseRunner):
             ) as unwrapped_model:
                 system_prompts, init_user_prompts, envs = _set_batch_envs(test_batch) 
                 input_data_proto = _build_data_proto(system_prompts, init_user_prompts, envs)
-                
+
                 self.generation_manager.actor_rollout_wg = unwrapped_model
                 outputs: InteractionDataProto = self.generation_manager.run_agent_loop(input_data_proto)
-                
+
                 inter_histories = outputs.no_tensor_batch["inter_histories"]
                 inter_context = self.processing_class.apply_chat_template(inter_histories, tokenize=False)
 
@@ -348,13 +346,12 @@ class LatentMemoryRunner(BaseRunner):
             for env in input_data_proto.no_tensor_batch["envs"]:
                 reward = env.feedback()
                 rewards.append(reward)
-            
+
             recorder.record_batch(inter_context, rewards)
-        
+
         recorder.finalize()
         writer.close()
 
-    
     # ===== runner configs =====
     def _parse_configs(self, configs):
         """build configs
@@ -364,27 +361,33 @@ class LatentMemoryRunner(BaseRunner):
         - evaluatoin config
         """
         self.save_dir = configs.get("save_dir")
-        use_tensorboard = configs.get("use_wandb")
-        
+        use_wandb = configs.get("use_wandb", False)
+        wandb_project = configs.get("wandb_project", "memgen")
+        wandb_run_name = configs.get("wandb_run_name", None)
+
         # weaver configs
         self.train_weaver = configs.get("train_weaver", True)
         if self.train_weaver:
             self.train_weaver_method = configs.get("train_weaver_method", "sft")
             weaver_save_dir = os.path.join(self.save_dir, "weaver")
             weaver_config = configs.get("weaver", {})
-            
+
             # train weaver with sft
             if self.train_weaver_method == "sft":
                 sft_config = weaver_config.get("sft", {})
-                weaver_args_dict = self._parse_common_training_args(sft_config, weaver_save_dir, use_tensorboard)
+                weaver_args_dict = self._parse_common_training_args(
+                    sft_config, weaver_save_dir, use_wandb, wandb_project, wandb_run_name
+                )
                 self.weaver_training_args = SFTConfig(**weaver_args_dict)
-            
+
             # train weaver with grpo
             elif self.train_weaver_method == "grpo":
                 grpo_config = weaver_config.get("grpo", {})
-                weaver_args_dict = self._parse_common_training_args(grpo_config, weaver_save_dir, use_tensorboard, is_grpo=True)
+                weaver_args_dict = self._parse_common_training_args(
+                    grpo_config, weaver_save_dir, use_wandb, wandb_project, wandb_run_name, is_grpo=True
+                )
                 self.weaver_reward_names = weaver_args_dict.pop("reward_names")
-                
+
                 self.weaver_training_args = GRPOConfig(**weaver_args_dict)
 
             else:
@@ -399,9 +402,11 @@ class LatentMemoryRunner(BaseRunner):
 
             if self.train_trigger_method == "grpo":
                 grpo_config = trigger_config.get("grpo", {})
-                trigger_args_dict = self._parse_common_training_args(grpo_config, trigger_save_dir, use_tensorboard, is_grpo=True)
+                trigger_args_dict = self._parse_common_training_args(
+                    grpo_config, trigger_save_dir, use_wandb, wandb_project, wandb_run_name, is_grpo=True
+                )
                 self.trigger_reward_names = trigger_args_dict.pop("reward_names")
-                
+
                 self.trigger_training_args = GRPOConfig(**trigger_args_dict)
             else:
                 raise ValueError("Unsupported weaver training mode")
@@ -417,7 +422,7 @@ class LatentMemoryRunner(BaseRunner):
             do_sample=generation_configs.get("do_sample", False),
             temperature=generation_configs.get("temperature", 1.0)
         )
-        
+
         # Evaluation configs
         eval_dir = os.path.join(self.save_dir, "evaluate")
         eval_batch_size = generation_configs.get("eval_batch_size", 32)
@@ -435,8 +440,10 @@ class LatentMemoryRunner(BaseRunner):
             self.trigger_training_args.max_prompt_length = self.interaction_config.max_start_length
             self.trigger_training_args.max_completion_length = self.interaction_config.max_response_length
             self.trigger_training_args.temperature = self.interaction_config.temperature
-       
-    def _parse_common_training_args(self, config_dict, output_dir, use_tensorboard, is_grpo=False):
+
+    def _parse_common_training_args(
+        self, config_dict, output_dir, use_wandb, wandb_project, wandb_run_name, is_grpo=False
+    ):
         batch_size = config_dict.get("batch_size", 4)
         max_epochs = config_dict.get("max_epochs", 2)
         grad_accum_steps = config_dict.get("grad_accum_steps", 1)
@@ -448,12 +455,13 @@ class LatentMemoryRunner(BaseRunner):
 
         logging_strategy = config_dict.get("logging_strategy", "steps")
         logging_steps = config_dict.get("logging_steps", 1) if logging_strategy == "steps" else None
-        
+
         eval_strategy = config_dict.get("eval_strategy", "steps")
         eval_steps = config_dict.get("eval_steps", 200) if eval_strategy == "steps" else None
-        
+
         save_strategy = config_dict.get("save_strategy", "steps")
         save_steps = config_dict.get("save_steps", 200) if save_strategy == "steps" else None
+        load_best_model_at_end = config_dict.get("load_best_model_at_end", True)
 
         # common args dict
         args_dict = {
@@ -472,12 +480,22 @@ class LatentMemoryRunner(BaseRunner):
             "save_steps": save_steps,
             "eval_strategy": eval_strategy,
             "eval_steps": eval_steps,
-            "report_to": ["tensorboard"] if use_tensorboard else [],   # <-- set to tensorboard
+            "report_to": ["wandb"] if use_wandb else [],
             "remove_unused_columns": False,
-            "load_best_model_at_end": True,
+            "load_best_model_at_end": load_best_model_at_end,
             "bf16": True,
         }
-        
+
+        # wandb specific settings
+        if use_wandb:
+            import os
+
+            # Set wandb project via environment variable
+            os.environ["WANDB_PROJECT"] = wandb_project
+            # Set run name if provided
+            if wandb_run_name:
+                args_dict["run_name"] = wandb_run_name
+
         # add grpo specific args
         if is_grpo:
             args_dict.update({
@@ -492,7 +510,7 @@ class LatentMemoryRunner(BaseRunner):
             rewards = config_dict.get("reward_funcs", [])
             reward_weights = [r["weight"] for r in rewards]
             reward_names = [r["name"] for r in rewards]  
-            
+
             args_dict.update({
                 "reward_weights": reward_weights,
                 "reward_names": reward_names
@@ -503,6 +521,5 @@ class LatentMemoryRunner(BaseRunner):
                 "max_length": config_dict.get("max_length", 1024),
                 "assistant_only_loss": config_dict.get("assistant_only_loss", True)
             })
-        
+
         return args_dict
-    
