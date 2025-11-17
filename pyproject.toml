@@ -1,0 +1,36 @@
+[project]
+name = "memgen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11.13"
+dependencies = [
+    "accelerate>=1.11.0",
+    "datasets>=4.4.1",
+    "deepspeed>=0.18.2",
+    "flash-attn>=2.8.3",
+    "omegaconf>=2.3.0",
+    "peft>=0.18.0",
+    "tensorboard>=2.20.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
+    "transformers==4.55.4",
+    "trl==0.21.0",
+    "vllm>=0.10.1.1",
+    "wandb>=0.23.0",
+]
+[tool.uv]
+no-build-isolation-package = ['flash-attn', 'setuptools']
+[tool.uv.sources] 
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
